@@ -1,18 +1,27 @@
 name: "AppPolicy Copilot Action"
-description: "Run AppPolicy scanner and fail on blocking findings."
+description: "Run AppPolicy scanner and fail on policy risk thresholds."
 author: "AppPolicy"
 inputs:
   ios_project:
-    description: "Path to iOS project"
+    description: "Path to iOS project (leave empty to skip)"
     required: false
     default: ""
   android_project:
-    description: "Path to Android project"
+    description: "Path to Android project (leave empty to skip)"
     required: false
     default: ""
   rules_path:
-    description: "Path or URL to rules (community.yaml or pro pack path)"
-    required: true
+    description: "Path to community YAML rules in the repo"
+    required: false
+    default: ""
+  rules_pack_url:
+    description: "HTTPS URL to signed Pro rules pack (.tar.gz)"
+    required: false
+    default: ""
+  public_key_hex:
+    description: "Trusted Ed25519 public key (hex) for verifying Pro packs"
+    required: false
+    default: ""
   fail_on:
     description: "Severity threshold to fail (blocking|advisory|none)"
     required: false
@@ -23,44 +32,69 @@ runs:
     - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+
     - name: Install AppPolicy scanner
       shell: bash
       run: |
-        pip install "apppolicy-scanner>=0.1.0"
+        set -e
+        pip install "apppolicy-scanner[pro]>=0.1.0"
+
     - name: Scan iOS (if provided)
       if: inputs.ios_project != ''
       shell: bash
       run: |
+        set -e
         apppolicy scan-ios --project "${{ inputs.ios_project }}" --out ios_facts.json
+
     - name: Scan Android (if provided)
       if: inputs.android_project != ''
       shell: bash
       run: |
+        set -e
         apppolicy scan-android --project "${{ inputs.android_project }}" --out android_facts.json
-    - name: Evaluate
+
+    - name: Evaluate (community or pro)
       shell: bash
+      env:
+        APPPOLICY_PUBKEY_HEX: ${{ inputs.public_key_hex }}
       run: |
-        FACTS=()
-        [ -f ios_facts.json ] && FACTS+=(ios_facts.json)
-        [ -f android_facts.json ] && FACTS+=(android_facts.json)
-        apppolicy evaluate --facts "${FACTS[@]}" --rules "${{ inputs.rules_path }}" --out report.json
-    - name: Upload report
+        set -e
+        # Build FACTS list based on what was scanned
+        FACTS_ARGS=""
+        if [ -f ios_facts.json ]; then FACTS_ARGS="$FACTS_ARGS ios_facts.json"; fi
+        if [ -f android_facts.json ]; then FACTS_ARGS="$FACTS_ARGS android_facts.json"; fi
+
+        # Require at least one rules input
+        if [ -n "${{ inputs.rules_pack_url }}" ]; then
+          if [ -z "${APPPOLICY_PUBKEY_HEX}" ]; then
+            echo "::error::public_key_hex is required when rules_pack_url is provided"; exit 1;
+          fi
+          apppolicy evaluate --facts $FACTS_ARGS --rules-pack "${{ inputs.rules_pack_url }}" --out report.json
+        elif [ -n "${{ inputs.rules_path }}" ]; then
+          apppolicy evaluate --facts $FACTS_ARGS --rules "${{ inputs.rules_path }}" --out report.json
+        else
+          echo "::error::Provide either rules_path or rules_pack_url"; exit 1;
+        fi
+
+    - name: Upload report artifact
       uses: actions/upload-artifact@v4
       with:
         name: apppolicy-report
         path: report.json
-    - name: Fail on threshold
+
+    - name: Enforce threshold
       shell: bash
       run: |
         python - <<'PY'
         import json, sys
-        fail_on = "${{ inputs.fail_on }}".strip().lower()
+        threshold = "${{ inputs.fail_on }}".strip().lower()
+        # Lower rank = more severe
+        sev_rank = {"blocking":1, "advisory":2, "fyi":3}
+        # Fail if any finding with rank <= threshold rank
+        threshold_rank = {"blocking":1, "advisory":2, "none":99}.get(threshold, 1)
         data = json.load(open('report.json'))
-        sev_rank = {"blocking":3, "advisory":2, "none":99}
-        max_sev = 0
-        for f in data.get("findings", []):
-            max_sev = max(max_sev, {"blocking":3,"advisory":2,"fyi":1}.get(f.get("severity","advisory"),0))
-        if max_sev >= sev_rank.get(fail_on, 3):
-            print(f"Failing due to severity threshold: {fail_on}"); sys.exit(1)
-        print("No blocking findings over threshold.")
+        worst = min([sev_rank.get(f.get("severity","fyi"),3) for f in data.get("findings",[])], default=99)
+        if worst <= threshold_rank:
+            print(f"Failing due to findings at/over threshold ({threshold})."); sys.exit(1)
+        print("No findings at/over threshold.")
         PY
