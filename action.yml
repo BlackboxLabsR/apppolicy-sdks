@@ -1,0 +1,66 @@
+name: "AppPolicy Copilot Action"
+description: "Run AppPolicy scanner and fail on blocking findings."
+author: "AppPolicy"
+inputs:
+  ios_project:
+    description: "Path to iOS project"
+    required: false
+    default: ""
+  android_project:
+    description: "Path to Android project"
+    required: false
+    default: ""
+  rules_path:
+    description: "Path or URL to rules (community.yaml or pro pack path)"
+    required: true
+  fail_on:
+    description: "Severity threshold to fail (blocking|advisory|none)"
+    required: false
+    default: "blocking"
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install AppPolicy scanner
+      shell: bash
+      run: |
+        pip install "apppolicy-scanner>=0.1.0"
+    - name: Scan iOS (if provided)
+      if: inputs.ios_project != ''
+      shell: bash
+      run: |
+        apppolicy scan-ios --project "${{ inputs.ios_project }}" --out ios_facts.json
+    - name: Scan Android (if provided)
+      if: inputs.android_project != ''
+      shell: bash
+      run: |
+        apppolicy scan-android --project "${{ inputs.android_project }}" --out android_facts.json
+    - name: Evaluate
+      shell: bash
+      run: |
+        FACTS=()
+        [ -f ios_facts.json ] && FACTS+=(ios_facts.json)
+        [ -f android_facts.json ] && FACTS+=(android_facts.json)
+        apppolicy evaluate --facts "${FACTS[@]}" --rules "${{ inputs.rules_path }}" --out report.json
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      with:
+        name: apppolicy-report
+        path: report.json
+    - name: Fail on threshold
+      shell: bash
+      run: |
+        python - <<'PY'
+        import json, sys
+        fail_on = "${{ inputs.fail_on }}".strip().lower()
+        data = json.load(open('report.json'))
+        sev_rank = {"blocking":3, "advisory":2, "none":99}
+        max_sev = 0
+        for f in data.get("findings", []):
+            max_sev = max(max_sev, {"blocking":3,"advisory":2,"fyi":1}.get(f.get("severity","advisory"),0))
+        if max_sev >= sev_rank.get(fail_on, 3):
+            print(f"Failing due to severity threshold: {fail_on}"); sys.exit(1)
+        print("No blocking findings over threshold.")
+        PY
