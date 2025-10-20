@@ -1,6 +1,7 @@
 name: "AppPolicy Copilot Action"
 description: "Run AppPolicy scanner and fail on policy risk thresholds."
 author: "AppPolicy"
+
 inputs:
   ios_project:
     description: "Path to iOS project (leave empty to skip)"
@@ -11,11 +12,11 @@ inputs:
     required: false
     default: ""
   rules_path:
-    description: "Path to community YAML rules in the repo"
+    description: "Path to community YAML rules (in repo)"
     required: false
     default: ""
   rules_pack_url:
-    description: "HTTPS URL to signed Pro rules pack (.tar.gz)"
+    description: "HTTPS URL or local path to signed Pro rules pack (.tar.gz)"
     required: false
     default: ""
   public_key_hex:
@@ -26,6 +27,7 @@ inputs:
     description: "Severity threshold to fail (blocking|advisory|none)"
     required: false
     default: "blocking"
+
 runs:
   using: "composite"
   steps:
@@ -37,7 +39,7 @@ runs:
       shell: bash
       run: |
         set -e
-        pip install "apppolicy-scanner[pro]>=0.1.0"
+        pip install "apppolicy-scanner[pro]>=1.0.2"
 
     - name: Scan iOS (if provided)
       if: inputs.ios_project != ''
@@ -59,12 +61,10 @@ runs:
         APPPOLICY_PUBKEY_HEX: ${{ inputs.public_key_hex }}
       run: |
         set -e
-        # Build FACTS list based on what was scanned
         FACTS_ARGS=""
-        if [ -f ios_facts.json ]; then FACTS_ARGS="$FACTS_ARGS ios_facts.json"; fi
-        if [ -f android_facts.json ]; then FACTS_ARGS="$FACTS_ARGS android_facts.json"; fi
+        [ -f ios_facts.json ] && FACTS_ARGS="$FACTS_ARGS ios_facts.json"
+        [ -f android_facts.json ] && FACTS_ARGS="$FACTS_ARGS android_facts.json"
 
-        # Require at least one rules input
         if [ -n "${{ inputs.rules_pack_url }}" ]; then
           if [ -z "${APPPOLICY_PUBKEY_HEX}" ]; then
             echo "::error::public_key_hex is required when rules_pack_url is provided"; exit 1;
@@ -88,13 +88,11 @@ runs:
         python - <<'PY'
         import json, sys
         threshold = "${{ inputs.fail_on }}".strip().lower()
-        # Lower rank = more severe
         sev_rank = {"blocking":1, "advisory":2, "fyi":3}
-        # Fail if any finding with rank <= threshold rank
-        threshold_rank = {"blocking":1, "advisory":2, "none":99}.get(threshold, 1)
+        thr = {"blocking":1, "advisory":2, "none":99}[threshold]
         data = json.load(open('report.json'))
         worst = min([sev_rank.get(f.get("severity","fyi"),3) for f in data.get("findings",[])], default=99)
-        if worst <= threshold_rank:
-            print(f"Failing due to findings at/over threshold ({threshold})."); sys.exit(1)
+        if worst <= thr:
+          print(f"Failing due to findings at/over threshold ({threshold})."); sys.exit(1)
         print("No findings at/over threshold.")
         PY
